@@ -7,7 +7,7 @@ class DAT_TRACKER:
     def __init__(self, cfg):
         self.cfg = cfg
         self.scale_factor_ = 1.0
-        self.prob_lut_ = None
+        self.prob_lut_ =  np.random.rand(256, 256, 256).astype(np.float32) 
         self.prob_lut_distractor_ = None
         self.prob_lut_masked_ = None
         self.adaptive_threshold_ = None
@@ -110,6 +110,7 @@ class DAT_TRACKER:
             raise ValueError("Expected a 3-channel (RGB) image")
 
         # Ensure bin_mapping is 1D with 256 elements
+        print(bin_mapping.shape)
         if bin_mapping.size != 256 or bin_mapping.ndim != 1:
             raise ValueError("bin_mapping must be a 1D array with 256 elements")
 
@@ -280,18 +281,157 @@ class DAT_TRACKER:
         mask[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]] = 0
         return out, mask
 
-    # def get_subwindow(self, frame, center_coor, sz):
-    #     lefttop_x = max(0, min(frame.shape[1] - 1, center_coor[0] - sz[0] // 2))
-    #     lefttop_y = max(0, min(frame.shape[0] - 1, center_coor[1] - sz[1] // 2))
-    #     rightbottom_x = lefttop_x + sz[0]
-    #     rightbottom_y = lefttop_y + sz[1]
 
-    #     border = (max(0, -lefttop_x), max(0, -lefttop_y), max(0, rightbottom_x - frame.shape[1]), max(0, rightbottom_y - frame.shape[0]))
-    #     lefttop_limit = (max(lefttop_x, 0), max(lefttop_y, 0))
-    #     rightbottom_limit = (min(rightbottom_x, frame.shape[1]), min(rightbottom_y, frame.shape[0]))
 
-    #     sub_window = frame[lefttop_limit[1]:rightbottom_limit[1], lefttop_limit[0]:rightbottom_limit[0]].copy()
+    def get_nms_rects(self, prob_map, obj_sz, scale, overlap, score_frac, dist_map, include_inner):
+        height, width = prob_map.shape[:2]
+        
+        rect_sz = (int(np.floor(obj_sz[0] * scale)), int(np.floor(obj_sz[1] * scale)))
+        o_x, o_y = (0, 0)
+        
+        if include_inner:
+            o_x = round(max(1.0, rect_sz[0] * 0.2))
+            o_y = round(max(1.0, rect_sz[1] * 0.2))
+        
+        stepx = max(1, int(round(rect_sz[0] * (1.0 - overlap))))
+        stepy = max(1, int(round(rect_sz[1] * (1.0 - overlap))))
+        
+        posx = list(range(0, width - rect_sz[0] + 1, stepx))
+        posy = list(range(0, height - rect_sz[1] + 1, stepy))
 
-    #     if any(border):
-    #         sub_window = cv2.copyMakeBorder(sub_window, border[1], border[3], border[0], border[2], cv2.BORDER_REPLICATE)
-    #     return sub_window
+        x, y = np.meshgrid(posx, posy, indexing='ij')
+        r = np.minimum(x + rect_sz[0], width - 1)
+        b = np.minimum(y + rect_sz[1], height - 1)
+        
+        boxes = [(x[i, j], y[i, j], r[i, j] - x[i, j], b[i, j] - y[i, j]) 
+                for i in range(x.shape[0]) for j in range(x.shape[1])]
+        
+        boxes_inner = []
+        
+        if include_inner:
+            boxes_inner = [(x[i, j] + o_x, y[i, j] + o_y, 
+                            r[i, j] - x[i, j] - 2 * o_x, 
+                            b[i, j] - y[i, j] - 2 * o_y) 
+                        for i in range(x.shape[0]) for j in range(x.shape[1])]
+        
+        bl = np.stack([x, b], axis=-1)
+        br = np.stack([r, b], axis=-1)
+        tl = np.stack([x, y], axis=-1)
+        tr = np.stack([r, y], axis=-1)
+        
+        bl_inner, br_inner, tl_inner, tr_inner = (None, None, None, None)
+        
+        if include_inner:
+            bl_inner = np.stack([x + o_x, b - o_y], axis=-1)
+            br_inner = np.stack([r - o_x, b - o_y], axis=-1)
+            tl_inner = np.stack([x + o_x, y + o_y], axis=-1)
+            tr_inner = np.stack([r - o_x, y + o_y], axis=-1)
+        
+        int_prob_map = cv2.integral(prob_map)
+        int_dist_map = cv2.integral(dist_map)
+        
+        # Ensure these are 2D arrays with valid values
+        print("int_prob_map shape:", int_prob_map.shape)
+        print("int_dist_map shape:", int_dist_map.shape)
+
+        v_scores = np.zeros(len(bl), dtype=np.float32)
+        d_scores = np.zeros(len(bl), dtype=np.float32)
+        
+        for i in range(len(bl)):
+            br_idx = br[i]
+            bl_idx = bl[i]
+            tr_idx = tr[i]
+            tl_idx = tl[i]
+
+            print(f'Indices: bl={bl_idx}, br={br_idx}, tl={tl_idx}, tr={tr_idx}')
+            
+            # Extract scalar values and ensure they are scalars
+            prob_br = int_prob_map[br_idx[1], br_idx[0]]
+            prob_bl = int_prob_map[bl_idx[1], bl_idx[0]]
+            prob_tr = int_prob_map[tr_idx[1], tr_idx[0]]
+            prob_tl = int_prob_map[tl_idx[1], tl_idx[0]]
+            
+            # Debugging: Ensure extracted values are scalars
+            if np.ndim(prob_br) != 0 or np.ndim(prob_bl) != 0 or np.ndim(prob_tr) != 0 or np.ndim(prob_tl) != 0:
+                print("Error: One of the values is not a scalar")
+                print(f"prob_br: {prob_br}, prob_bl: {prob_bl}, prob_tr: {prob_tr}, prob_tl: {prob_tl}")
+
+            # Assign the scores
+            v_scores[i] = float(prob_br - prob_bl - prob_tr + prob_tl)  # Ensure it's a float
+            dist_br = int_dist_map[br_idx[1], br_idx[0]]
+            dist_bl = int_dist_map[bl_idx[1], bl_idx[0]]
+            dist_tr = int_dist_map[tr_idx[1], tr_idx[0]]
+            dist_tl = int_dist_map[tl_idx[1], tl_idx[0]]
+            
+            d_scores[i] = float(dist_br - dist_bl - dist_tr + dist_tl)  # Ensure it's a float
+
+        scores_inner = np.zeros(len(bl), dtype=np.float32)
+        
+        if include_inner:
+            for i in range(len(bl)):
+                scores_inner[i] = (int_prob_map[br_inner[i][1], br_inner[i][0]] - 
+                                int_prob_map[bl_inner[i][1], bl_inner[i][0]] - 
+                                int_prob_map[tr_inner[i][1], tr_inner[i][0]] + 
+                                int_prob_map[tl_inner[i][1], tl_inner[i][0]])
+
+                if (rect_sz[0] - 2 * o_x) > 0 and (rect_sz[1] - 2 * o_y) > 0:
+                    v_scores[i] += (scores_inner[i] / float((rect_sz[0] - 2 * o_x) * (rect_sz[1] - 2 * o_y)))
+
+        top_rects = []
+        top_vote_scores = []
+        top_dist_scores = []
+        
+        max_idx = np.argmax(v_scores)
+        max_score = v_scores[max_idx]
+        
+        while max_score > score_frac * max(v_scores):
+            x, y, w, h = boxes[max_idx]
+            prob_map[y:y + h, x:x + w] = 0.0
+            
+            top_rects.append(boxes[max_idx])
+            top_vote_scores.append(v_scores[max_idx])
+            top_dist_scores.append(d_scores[max_idx])
+            
+            boxes.pop(max_idx)
+            if include_inner:
+                boxes_inner.pop(max_idx)
+            
+            bl = np.delete(bl, max_idx, axis=0)
+            br = np.delete(br, max_idx, axis=0)
+            tl = np.delete(tl, max_idx, axis=0)
+            tr = np.delete(tr, max_idx, axis=0)
+            
+            if include_inner:
+                bl_inner = np.delete(bl_inner, max_idx, axis=0)
+                br_inner = np.delete(br_inner, max_idx, axis=0)
+                tl_inner = np.delete(tl_inner, max_idx, axis=0)
+                tr_inner = np.delete(tr_inner, max_idx, axis=0)
+            
+            int_prob_map = cv2.integral(prob_map)
+            int_dist_map = cv2.integral(dist_map)
+            
+            v_scores = np.zeros(len(bl), dtype=np.float32)
+            d_scores = np.zeros(len(bl), dtype=np.float32)
+            
+            for i in range(len(bl)):
+                v_scores[i] = (int_prob_map[br[i][1], br[i][0]] - 
+                            int_prob_map[bl[i][1], bl[i][0]] - 
+                            int_prob_map[tr[i][1], tr[i][0]] + 
+                            int_prob_map[tl[i][1], tl[i][0]])
+                d_scores[i] = (int_dist_map[br[i][1], br[i][0]] - 
+                            int_dist_map[bl[i][1], bl[i][0]] - 
+                            int_dist_map[tr[i][1], tr[i][0]] + 
+                            int_dist_map[tl[i][1], tl[i][0]])
+            
+            if include_inner:
+                for i in range(len(bl)):
+                    scores_inner[i] = (int_prob_map[br_inner[i][1], br_inner[i][0]] - 
+                                    int_prob_map[bl_inner[i][1], bl_inner[i][0]] - 
+                                    int_prob_map[tr_inner[i][1], tr_inner[i][0]] + 
+                                    int_prob_map[tl_inner[i][1], tl_inner[i][0]])
+                    v_scores[i] += (scores_inner[i] / float(rect_sz[0] * rect_sz[1]))
+
+            max_idx = np.argmax(v_scores)
+            max_score = v_scores[max_idx]
+
+        return top_rects, top_vote_scores, top_dist_scores
