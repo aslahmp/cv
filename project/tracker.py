@@ -109,6 +109,10 @@ class DAT_TRACKER:
         if frame.shape[2] != 3:
             raise ValueError("Expected a 3-channel (RGB) image")
 
+        # Ensure bin_mapping is 1D with 256 elements
+        if bin_mapping.size != 256 or bin_mapping.ndim != 1:
+            raise ValueError("bin_mapping must be a 1D array with 256 elements")
+
         # Apply bin mapping to each channel using cv2.LUT
         frame_bin = np.zeros_like(frame)
         for i in range(3):  # Iterate over each channel (B, G, R)
