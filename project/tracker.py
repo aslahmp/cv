@@ -32,12 +32,39 @@ class DAT_TRACKER:
         x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
         return img[y1:y2, x1:x2]
 
-    def get_foreground_background_probs(self, surr_win, obj_rect_surr, num_bins, bin_mapping):
-        """Placeholder function for getting foreground/background probabilities."""
-        # This function needs to be implemented based on your tracking algorithm
-        # For now, let's return a dummy probability map
-        prob_map = np.zeros(surr_win.shape[:2], dtype=np.float32)
-        return prob_map
+    def get_foreground_background_probs(self, frame, obj_rect, num_bins,prob_lut):
+        img_count = 1
+        channels = [0, 1, 2]
+        mask = np.array([])
+        dims = 3
+        sizes = [num_bins, num_bins, num_bins]
+        b_range = [0, 256]
+        g_range = [0, 256]
+        r_range = [0, 256]
+        ranges = [b_range, g_range, r_range]
+
+        surr_hist = cv2.calcHist([frame], channels, mask, [num_bins, num_bins, num_bins], [0, 256, 0, 256, 0, 256])
+
+        obj_col = round(obj_rect[0])
+        obj_row = round(obj_rect[1])
+        obj_width = round(obj_rect[2])
+        obj_height = round(obj_rect[3])
+
+        if (obj_col + obj_width) > (frame.shape[1] - 1):
+            obj_width = (frame.shape[1] - 1) - obj_col
+        if (obj_row + obj_height) > (frame.shape[0] - 1):
+            obj_height = (frame.shape[0] - 1) - obj_row
+
+        obj_win = frame[max(0, obj_row):min(frame.shape[0], obj_row + obj_height + 1), 
+                        max(0, obj_col):min(frame.shape[1], obj_col + obj_width + 1)]
+        
+        obj_hist = cv2.calcHist([obj_win], channels, mask, [num_bins, num_bins, num_bins], [0, 256, 0, 256, 0, 256])
+        print('-------------------')
+        print(f"obj_hist shape: {obj_hist.shape} surr_hist shape: {surr_hist.shape}")
+        prob_lut = (obj_hist + 1) / (surr_hist + 2)
+        print(prob_lut.shape)
+        return prob_lut
+
 
     def get_adaptive_threshold(self, prob_map, obj_rect_surr):
         """Placeholder function for getting adaptive threshold."""
@@ -209,7 +236,8 @@ class DAT_TRACKER:
                 center = (float(hypotheses[i][0] + hypotheses[i][2] / 2), float(hypotheses[i][1] + hypotheses[i][3] / 2))
                 candidate_centers.append(center)
                 candidate_scores.append(vote_scores[i] * dist_scores[i])
-
+            if not candidate_scores:
+                return prev_pos[0],prev_pos[1], prev_sz[0], prev_sz[1]
             best_candidate_index = np.argmax(candidate_scores)
             target_pos = candidate_centers[best_candidate_index]
 
@@ -262,6 +290,10 @@ class DAT_TRACKER:
                     if not distractors or (max(distractor_overlap) < 0.1):
                         self.prob_lut_ = (1 - self.cfg['prob_lut_update_rate']) * self.prob_lut_ + \
                                         self.cfg['prob_lut_update_rate'] * prob_lut_bg
+                        
+
+
+
     def intersection_over_union(self, target_rect, candidates):
         intersection_area = (target_rect & candidates).area()
         return float(intersection_area) / float(target_rect.area() + candidates.area() - intersection_area)
@@ -283,155 +315,113 @@ class DAT_TRACKER:
 
 
 
+
     def get_nms_rects(self, prob_map, obj_sz, scale, overlap, score_frac, dist_map, include_inner):
-        height, width = prob_map.shape[:2]
-        
+        height, width = prob_map.shape
         rect_sz = (int(np.floor(obj_sz[0] * scale)), int(np.floor(obj_sz[1] * scale)))
+
+        # Calculate padding values if including inner rectangles
         o_x, o_y = (0, 0)
-        
         if include_inner:
             o_x = round(max(1.0, rect_sz[0] * 0.2))
             o_y = round(max(1.0, rect_sz[1] * 0.2))
-        
+
         stepx = max(1, int(round(rect_sz[0] * (1.0 - overlap))))
         stepy = max(1, int(round(rect_sz[1] * (1.0 - overlap))))
-        
+
         posx = list(range(0, width - rect_sz[0] + 1, stepx))
         posy = list(range(0, height - rect_sz[1] + 1, stepy))
 
-        x, y = np.meshgrid(posx, posy, indexing='ij')
-        r = np.minimum(x + rect_sz[0], width - 1)
-        b = np.minimum(y + rect_sz[1], height - 1)
-        
-        boxes = [(x[i, j], y[i, j], r[i, j] - x[i, j], b[i, j] - y[i, j]) 
-                for i in range(x.shape[0]) for j in range(x.shape[1])]
-        
+        # Generate grid of boxes
+        x, y = np.meshgrid(posx, posy)
+        r = x + rect_sz[0]
+        b = y + rect_sz[1]
+
+        r[r > (width - 1)] = width - 1
+        b[b > (height - 1)] = height - 1
+
+        boxes = [(x[i, j], y[i, j], r[i, j] - x[i, j], b[i, j] - y[i, j]) for i in range(len(posy)) for j in range(len(posx))]
+
         boxes_inner = []
-        
         if include_inner:
-            boxes_inner = [(x[i, j] + o_x, y[i, j] + o_y, 
-                            r[i, j] - x[i, j] - 2 * o_x, 
-                            b[i, j] - y[i, j] - 2 * o_y) 
-                        for i in range(x.shape[0]) for j in range(x.shape[1])]
-        
-        bl = np.stack([x, b], axis=-1)
-        br = np.stack([r, b], axis=-1)
-        tl = np.stack([x, y], axis=-1)
-        tr = np.stack([r, y], axis=-1)
-        
-        bl_inner, br_inner, tl_inner, tr_inner = (None, None, None, None)
-        
-        if include_inner:
-            bl_inner = np.stack([x + o_x, b - o_y], axis=-1)
-            br_inner = np.stack([r - o_x, b - o_y], axis=-1)
-            tl_inner = np.stack([x + o_x, y + o_y], axis=-1)
-            tr_inner = np.stack([r - o_x, y + o_y], axis=-1)
-        
-        int_prob_map = cv2.integral(prob_map)
-        int_dist_map = cv2.integral(dist_map)
-        
-        # Ensure these are 2D arrays with valid values
-        print("int_prob_map shape:", int_prob_map.shape)
-        print("int_dist_map shape:", int_dist_map.shape)
+            for box in boxes:
+                boxes_inner.append((box[0] + o_x, box[1] + o_y, box[2] - 2 * o_x, box[3] - 2 * o_y))
 
-        v_scores = np.zeros(len(bl), dtype=np.float32)
-        d_scores = np.zeros(len(bl), dtype=np.float32)
-        
-        for i in range(len(bl)):
-            br_idx = br[i]
-            bl_idx = bl[i]
-            tr_idx = tr[i]
-            tl_idx = tl[i]
+        # Compute integral maps
+        int_prob_map = cv2.integral(prob_map.astype(np.float32))
+        int_dist_map = cv2.integral(dist_map.astype(np.float32))
 
+        # Initialize scores
+        v_scores = np.zeros(len(boxes), dtype=np.float32)
+        d_scores = np.zeros(len(boxes), dtype=np.float32)
+
+        for i in range(len(boxes)):
+            bl_idx = (boxes[i][0], boxes[i][1])
+            br_idx = (boxes[i][0] + boxes[i][2], boxes[i][1])
+            tl_idx = (boxes[i][0], boxes[i][1] + boxes[i][3])
+            tr_idx = (boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3])
+
+            # Debugging: Print indices to ensure they are correct
             print(f'Indices: bl={bl_idx}, br={br_idx}, tl={tl_idx}, tr={tr_idx}')
-            
-            # Extract scalar values and ensure they are scalars
+
+            # Extract probabilities and ensure they're scalars
             prob_br = int_prob_map[br_idx[1], br_idx[0]]
             prob_bl = int_prob_map[bl_idx[1], bl_idx[0]]
             prob_tr = int_prob_map[tr_idx[1], tr_idx[0]]
             prob_tl = int_prob_map[tl_idx[1], tl_idx[0]]
-            
-            # Debugging: Ensure extracted values are scalars
-            if np.ndim(prob_br) != 0 or np.ndim(prob_bl) != 0 or np.ndim(prob_tr) != 0 or np.ndim(prob_tl) != 0:
-                print("Error: One of the values is not a scalar")
-                print(f"prob_br: {prob_br}, prob_bl: {prob_bl}, prob_tr: {prob_tr}, prob_tl: {prob_tl}")
 
-            # Assign the scores
-            v_scores[i] = float(prob_br - prob_bl - prob_tr + prob_tl)  # Ensure it's a float
+            # Debugging: Print probabilities
+            print(f'Probabilities: prob_br={prob_br}, prob_bl={prob_bl}, prob_tr={prob_tr}, prob_tl={prob_tl}')
+            print(f'Shapes: prob_br.shape={np.shape(prob_br)}, prob_bl.shape={np.shape(prob_bl)}, prob_tr.shape={np.shape(prob_tr)}, prob_tl.shape={np.shape(prob_tl)}')
+
+            # Ensure all are scalars before proceeding
+            if np.ndim(prob_br) == 0 and np.ndim(prob_bl) == 0 and np.ndim(prob_tr) == 0 and np.ndim(prob_tl) == 0:
+                v_scores[i] = float(prob_br - prob_bl - prob_tr + prob_tl)
+            else:
+                print("Error: One of the probability values is not a scalar")
+                continue  # Skip this box if there was an error
+
             dist_br = int_dist_map[br_idx[1], br_idx[0]]
             dist_bl = int_dist_map[bl_idx[1], bl_idx[0]]
             dist_tr = int_dist_map[tr_idx[1], tr_idx[0]]
             dist_tl = int_dist_map[tl_idx[1], tl_idx[0]]
-            
-            d_scores[i] = float(dist_br - dist_bl - dist_tr + dist_tl)  # Ensure it's a float
 
-        scores_inner = np.zeros(len(bl), dtype=np.float32)
-        
-        if include_inner:
-            for i in range(len(bl)):
-                scores_inner[i] = (int_prob_map[br_inner[i][1], br_inner[i][0]] - 
-                                int_prob_map[bl_inner[i][1], bl_inner[i][0]] - 
-                                int_prob_map[tr_inner[i][1], tr_inner[i][0]] + 
-                                int_prob_map[tl_inner[i][1], tl_inner[i][0]])
+            d_scores[i] = float(dist_br - dist_bl - dist_tr + dist_tl)
 
-                if (rect_sz[0] - 2 * o_x) > 0 and (rect_sz[1] - 2 * o_y) > 0:
-                    v_scores[i] += (scores_inner[i] / float((rect_sz[0] - 2 * o_x) * (rect_sz[1] - 2 * o_y)))
-
+        # Now process scores to find top rectangles
         top_rects = []
         top_vote_scores = []
         top_dist_scores = []
-        
-        max_idx = np.argmax(v_scores)
-        max_score = v_scores[max_idx]
-        
-        while max_score > score_frac * max(v_scores):
-            x, y, w, h = boxes[max_idx]
-            prob_map[y:y + h, x:x + w] = 0.0
-            
-            top_rects.append(boxes[max_idx])
-            top_vote_scores.append(v_scores[max_idx])
-            top_dist_scores.append(d_scores[max_idx])
-            
-            boxes.pop(max_idx)
-            if include_inner:
-                boxes_inner.pop(max_idx)
-            
-            bl = np.delete(bl, max_idx, axis=0)
-            br = np.delete(br, max_idx, axis=0)
-            tl = np.delete(tl, max_idx, axis=0)
-            tr = np.delete(tr, max_idx, axis=0)
-            
-            if include_inner:
-                bl_inner = np.delete(bl_inner, max_idx, axis=0)
-                br_inner = np.delete(br_inner, max_idx, axis=0)
-                tl_inner = np.delete(tl_inner, max_idx, axis=0)
-                tr_inner = np.delete(tr_inner, max_idx, axis=0)
-            
-            int_prob_map = cv2.integral(prob_map)
-            int_dist_map = cv2.integral(dist_map)
-            
-            v_scores = np.zeros(len(bl), dtype=np.float32)
-            d_scores = np.zeros(len(bl), dtype=np.float32)
-            
-            for i in range(len(bl)):
-                v_scores[i] = (int_prob_map[br[i][1], br[i][0]] - 
-                            int_prob_map[bl[i][1], bl[i][0]] - 
-                            int_prob_map[tr[i][1], tr[i][0]] + 
-                            int_prob_map[tl[i][1], tl[i][0]])
-                d_scores[i] = (int_dist_map[br[i][1], br[i][0]] - 
-                            int_dist_map[bl[i][1], bl[i][0]] - 
-                            int_dist_map[tr[i][1], tr[i][0]] + 
-                            int_dist_map[tl[i][1], tl[i][0]])
-            
-            if include_inner:
-                for i in range(len(bl)):
-                    scores_inner[i] = (int_prob_map[br_inner[i][1], br_inner[i][0]] - 
-                                    int_prob_map[bl_inner[i][1], bl_inner[i][0]] - 
-                                    int_prob_map[tr_inner[i][1], tr_inner[i][0]] + 
-                                    int_prob_map[tl_inner[i][1], tl_inner[i][0]])
-                    v_scores[i] += (scores_inner[i] / float(rect_sz[0] * rect_sz[1]))
 
-            max_idx = np.argmax(v_scores)
-            max_score = v_scores[max_idx]
+        best_score = np.max(v_scores)
+        while best_score > score_frac * np.max(v_scores):
+            midx = np.argmax(v_scores)
+            top_rects.append(boxes[midx])
+            top_vote_scores.append(v_scores[midx])
+            top_dist_scores.append(d_scores[midx])
+
+            # Set the box area in prob_map to zero to avoid re-selection
+            x1, y1, w, h = boxes[midx]
+            prob_map[y1:y1+h, x1:x1+w] = 0
+
+            # Recalculate scores
+            int_prob_map = cv2.integral(prob_map.astype(np.float32))
+            v_scores = np.zeros(len(boxes), dtype=np.float32)
+
+            for i in range(len(boxes)):
+                bl_idx = (boxes[i][0], boxes[i][1])
+                br_idx = (boxes[i][0] + boxes[i][2], boxes[i][1])
+                tl_idx = (boxes[i][0], boxes[i][1] + boxes[i][3])
+                tr_idx = (boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3])
+
+                prob_br = int_prob_map[br_idx[1], br_idx[0]]
+                prob_bl = int_prob_map[bl_idx[1], bl_idx[0]]
+                prob_tr = int_prob_map[tr_idx[1], tr_idx[0]]
+                prob_tl = int_prob_map[tl_idx[1], tl_idx[0]]
+
+                v_scores[i] = float(prob_br - prob_bl - prob_tr + prob_tl)
+
+            best_score = np.max(v_scores)
 
         return top_rects, top_vote_scores, top_dist_scores
+
